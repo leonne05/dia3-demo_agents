@@ -1,6 +1,7 @@
 from groq import Groq
 
 from dotenv import load_dotenv
+import base64
 import os
 from pathlib import Path
 
@@ -37,17 +38,73 @@ class ConversationAgent:
             }
         )
 
-    def ask_llm(self, question):
-        self.update_conversation_history(role="user", content=question)
+    def _messages_for_request(self, has_image):
+        if not has_image:
+            return self.conversation_history
+
+        recent_messages = self.conversation_history[1:]
+        latest_image_index = next(
+            (
+                index
+                for index in range(len(recent_messages) - 1, -1, -1)
+                if isinstance(recent_messages[index]["content"], list)
+            ),
+            None,
+        )
+        if latest_image_index is not None:
+            recent_messages = [
+                message
+                for index, message in enumerate(recent_messages)
+                if not isinstance(message["content"], list)
+                or index == latest_image_index
+            ]
+
+        return [self.conversation_history[0], *recent_messages[-4:]]
+
+    def ask_llm(self, question, image_file=None):
+        conversation_has_image = any(
+            isinstance(message["content"], list)
+            for message in self.conversation_history
+        )
+
+        if image_file is None:
+            user_content = question
+        else:
+            image_data = base64.b64encode(image_file.getvalue()).decode("utf-8")
+            user_content = [
+                {"type": "text", "text": question},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image_file.type};base64,{image_data}"
+                    },
+                },
+            ]
+
+        model = (
+            "qwen/qwen3.8-27b"
+            if image_file is not None or conversation_has_image
+            else "openai/gpt-oss-120b"
+        )
+
+        self.update_conversation_history(role="user", content=user_content)
 
         response = self.groq_client.chat.completions.create(
-            messages=self.conversation_history,
-            model="openai/gpt-oss-120b",
-            include_reasoning=False,
+            messages=self._messages_for_request(has_image=model == "qwen/qwen3.8-27b"),
+            model=model,
+            **({"include_reasoning": False} if image_file is None else {}),
         ).choices[0].message.content
 
         self.update_conversation_history(role="assistant", content=response)
         return response
+
+    def transcribe_audio(self, audio_file):
+        transcription = self.groq_client.audio.transcriptions.create(
+            file=(audio_file.name, audio_file.getvalue()),
+            model="whisper-large-v3-turbo",
+            response_format="json",
+        )
+        return transcription.text
 
 
 _agent = None
